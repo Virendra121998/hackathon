@@ -31,7 +31,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN;
 const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID;
 
-const openai = new OpenAI({ apiKey: "My API Key" });
+const openai = new OpenAI({ apiKey: `${OPENAI_API_KEY}` });
 
 function isAtomicComponent(node) {
   // List of common atomic component patterns
@@ -310,6 +310,302 @@ app.post('/api/commit-component', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'GitLab commit failed', details: err.message });
+  }
+});
+
+// --- New Combined Endpoint: Parse Figma and Check Components ---
+app.post('/api/parse-and-check', async (req, res) => {
+  const { fileKey, nodeId } = req.body;
+  
+  try {
+    // Step 1: Parse Figma file
+    console.log('Parsing Figma file...');
+    const fileResponse = await axios.get(`https://api.figma.com/v1/files/${fileKey}`, {
+      headers: { 
+        'X-Figma-Token': FIGMA_TOKEN,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    let nodeData;
+    if (nodeId) {
+      const nodeResponse = await axios.get(`https://api.figma.com/v1/files/${fileKey}/nodes?ids=${nodeId}`, {
+        headers: { 
+          'X-Figma-Token': FIGMA_TOKEN,
+          'Content-Type': 'application/json'
+        }
+      });
+      nodeData = nodeResponse.data.nodes[0].document;
+    } else {
+      nodeData = fileResponse.data.document;
+    }
+
+    const { atomicComponents, screens } = extractAllNestedComponents(nodeData);
+
+    // Step 2: Check components in registry
+    console.log('Checking components in registry...');
+    console.log('GitLab Configuration:', {
+      projectId: GITLAB_PROJECT_ID,
+      tokenLength: GITLAB_TOKEN.length,
+      tokenPrefix: GITLAB_TOKEN.substring(0, 4) + '...',
+      tokenEnd: GITLAB_TOKEN.substring(GITLAB_TOKEN.length - 4),
+      tokenFormat: GITLAB_TOKEN.startsWith('glpat-') ? 'glpat- format' : 'other format'
+    });
+
+    try {
+      // First, get the repository tree with pagination
+      let allFiles = [];
+      let page = 1;
+      let hasMore = true;
+      
+      const headers = { 
+        'PRIVATE-TOKEN': GITLAB_TOKEN,
+        'Content-Type': 'application/json'
+      };
+      
+      while (hasMore) {
+        const gitlabUrl = `https://gitlab.urbanclap.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/tree?recursive=true&per_page=100&page=${page}`;
+        console.log(`Fetching page ${page} of repository tree...`);
+        
+        const gitlabResponse = await axios.get(gitlabUrl, { headers });
+        
+        if (gitlabResponse.data.length === 0) {
+          hasMore = false;
+        } else {
+          allFiles = [...allFiles, ...gitlabResponse.data];
+          page++;
+        }
+      }
+      
+      console.log(`Total files found: ${allFiles.length}`);
+      console.log('All repository files:', allFiles.map(file => file.path));
+      
+      // Try different possible paths for the registry file
+      const possibleRegistryPaths = [
+        'packages/customer/src/registry.ts',
+        'packages/src/customer/vdlComponents/registry.ts',
+        'packages/src/registry.ts',
+        'src/registry.ts'
+      ];
+
+      let registryFile = null;
+      for (const path of possibleRegistryPaths) {
+        registryFile = allFiles.find(file => file.path === path);
+        if (registryFile) {
+          console.log(`Found registry file at: ${path}`);
+          break;
+        }
+      }
+
+      if (!registryFile) {
+        console.log('Registry file not found. Available paths:', allFiles.map(f => f.path));
+        return res.json({ 
+          success: true,
+          message: 'Registry file not found in repository',
+          availablePaths: allFiles.map(f => f.path),
+          components: {
+            existing: [],
+            new: atomicComponents
+          },
+          screens: screens,
+          fileInfo: {
+            name: fileResponse.data.name,
+            lastModified: fileResponse.data.lastModified,
+            version: fileResponse.data.version
+          }
+        });
+      }
+
+      // Get registry content
+      const registryUrl = `https://gitlab.urbanclap.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encodeURIComponent(registryFile.path)}/raw`;
+      console.log('Fetching registry content from:', registryUrl);
+      
+      const registryContentResponse = await axios.get(registryUrl, { headers });
+      console.log('Registry content response status:', registryContentResponse.status);
+
+      const registryContent = registryContentResponse.data;
+
+      // Use OpenAI to compare components
+      console.log('Using OpenAI to compare components...');
+      const componentNames = atomicComponents.map(c => c.name);
+      
+      const openaiResponse = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content: `Analyze component names against registry content. Return JSON with:
+            {
+              "existing": [{"originalName": "ComponentName", "matchedName": "RegistryName"}],
+              "new": ["ComponentName"]
+            }
+            
+            Rules:
+            1. Match variations (e.g., "BadgeStack" = "badge-stack" = "Badge Stack")
+            2. Consider partial matches (e.g., "Badge" in "BadgeStack")
+            3. Be conservative in matching`
+          },
+          {
+            role: "user",
+            content: `Registry:
+${registryContent}
+
+Components:
+${JSON.stringify(componentNames, null, 2)}`
+          }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1, // Lower temperature for more consistent results
+        max_tokens: 500  // Limit token usage
+      });
+
+      const analysis = JSON.parse(openaiResponse.choices[0].message.content);
+      console.log('OpenAI analysis:', analysis);
+
+      // Separate components based on OpenAI analysis
+      const existingComponents = atomicComponents.filter(component => 
+        analysis.existing.some(e => e.originalName === component.name)
+      );
+      
+      const newComponents = atomicComponents.filter(component => 
+        analysis.new.some(n => n === component.name)
+      );
+
+      res.json({ 
+        success: true,
+        message: 'Components parsed and checked successfully',
+        components: {
+          existing: existingComponents,
+          new: newComponents,
+          analysis: analysis // Include the OpenAI analysis for reference
+        },
+        screens: screens,
+        fileInfo: {
+          name: fileResponse.data.name,
+          lastModified: fileResponse.data.lastModified,
+          version: fileResponse.data.version
+        }
+      });
+    } catch (gitlabError) {
+      console.error('GitLab API Error Details:', {
+        url: gitlabError.config?.url,
+        method: gitlabError.config?.method,
+        headers: {
+          ...gitlabError.config?.headers,
+          'PRIVATE-TOKEN': gitlabError.config?.headers?.['PRIVATE-TOKEN']?.substring(0, 4) + '...' + gitlabError.config?.headers?.['PRIVATE-TOKEN']?.substring(gitlabError.config?.headers?.['PRIVATE-TOKEN']?.length - 4)
+        },
+        status: gitlabError.response?.status,
+        statusText: gitlabError.response?.statusText,
+        data: gitlabError.response?.data,
+        message: gitlabError.message
+      });
+
+      // Return components without registry check
+      return res.json({ 
+        success: true,
+        message: 'GitLab API access failed, returning all components as new',
+        components: {
+          existing: [],
+          new: atomicComponents
+        },
+        screens: screens,
+        fileInfo: {
+          name: fileResponse.data.name,
+          lastModified: fileResponse.data.lastModified,
+          version: fileResponse.data.version
+        },
+        gitlabError: {
+          status: gitlabError.response?.status,
+          message: gitlabError.response?.data?.message || gitlabError.message,
+          details: gitlabError.response?.data
+        }
+      });
+    }
+  } catch (err) {
+    console.error('Parse and check error:', err);
+    res.status(500).json({ 
+      error: 'Parse and check failed', 
+      details: err.message 
+    });
+  }
+});
+
+// --- Test GitLab Configuration ---
+app.get('/api/test-gitlab', async (req, res) => {
+  try {
+    // Check if environment variables are set
+    if (!GITLAB_TOKEN || !GITLAB_PROJECT_ID) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing GitLab configuration',
+        config: {
+          hasToken: !!GITLAB_TOKEN,
+          hasProjectId: !!GITLAB_PROJECT_ID
+        }
+      });
+    }
+
+    // Test project access
+    const projectResponse = await axios.get(
+      `https://gitlab.urbanclap.com/api/v4/projects/${GITLAB_PROJECT_ID}`,
+      {
+        headers: { 
+          'PRIVATE-TOKEN': GITLAB_TOKEN,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // Test repository access
+    const treeResponse = await axios.get(
+      `https://gitlab.urbanclap.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/tree?recursive=true`,
+      {
+        headers: { 
+          'PRIVATE-TOKEN': GITLAB_TOKEN,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    // Check for registry file
+    const registryFile = treeResponse.data.find(file => 
+      file.path === 'packages/src/customer/vdlComponents/registry.ts'
+    );
+
+    res.json({
+      success: true,
+      message: 'GitLab configuration verified successfully',
+      project: {
+        id: GITLAB_PROJECT_ID,
+        name: projectResponse.data.name,
+        path: projectResponse.data.path_with_namespace,
+        visibility: projectResponse.data.visibility
+      },
+      repository: {
+        hasAccess: true,
+        registryFile: registryFile ? {
+          path: registryFile.path,
+          type: registryFile.type
+        } : null
+      }
+    });
+  } catch (error) {
+    console.error('GitLab test error:', {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      message: error.message
+    });
+
+    res.status(500).json({
+      success: false,
+      message: 'GitLab configuration test failed',
+      error: {
+        status: error.response?.status,
+        message: error.response?.data?.message || error.message,
+        details: error.response?.data
+      }
+    });
   }
 });
 
